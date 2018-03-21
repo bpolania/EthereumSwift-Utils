@@ -27,6 +27,7 @@ class SECP256k1: NSObject {
         case keyParsingFailedWrongHeader
         case keyCombinationFailed
         case keyNegationFailed
+        case keyRecoveryFailed
         case tweakFailed
         case tweakFailedWrongTweakSize
     }
@@ -38,7 +39,10 @@ class SECP256k1: NSObject {
         case signatureVerificationFailed
         case signingFailed
         case signingFailedWrongMessageSize
-        
+    }
+    
+    enum nonceError: Error {
+        case nonceGenerationError
     }
     
     /**
@@ -59,8 +63,26 @@ class SECP256k1: NSObject {
      `SECP256K1_CONTEXT_SIGN` and `SECP256K1_CONTEXT_NONE`
      
      */
-    func createNewContext(flag: Int) {
+    func createContext(flag: Int) {
         secp256k1Context = secp256k1_context_create(UInt32((flag)))
+    }
+    
+    /**
+     
+     - Parameter context:  OpaquePointer a SECP256k1 context
+     
+     */
+    func setContext(context: OpaquePointer) {
+        secp256k1Context = context
+    }
+    
+    /**
+     
+     - Return: the current context
+     
+     */
+    func getContext() -> OpaquePointer {
+        return secp256k1Context
     }
     
     /**
@@ -167,11 +189,12 @@ class SECP256k1: NSObject {
      - Throws: keyError.keyVerificationFailed if function `secp256k1_ec_seckey_verify` returns 0
      
      */
-    func privateKeyVerify() throws {
+    func privateKeyVerify() -> Bool {
         let result = Int(secp256k1_ec_seckey_verify(secp256k1Context, privateKey)) as NSNumber
         if !result.boolValue {
-            throw keyError.keyVerificationFailed
+            return false
         }
+        return true
     }
     
     /**
@@ -183,14 +206,12 @@ class SECP256k1: NSObject {
      
      */
     func publicKeyCreate() throws {
-        do {
-            try privateKeyVerify()
+        let isPrivateKeyValid = privateKeyVerify()
+        if isPrivateKeyValid {
             let result = Int(secp256k1_ec_pubkey_create(secp256k1Context, publicKey, privateKey)) as NSNumber
             if !result.boolValue {
                 throw keyError.keyCreationFailed
             }
-        } catch keyError.keyVerificationFailed {
-            print("The Private Key Couldn't be verified")
         }
     }
     
@@ -213,7 +234,7 @@ class SECP256k1: NSObject {
      and the first byte is not either 0x04, 0x06 or 0x07.
      
      */
-    func publicKeyParse(publicKey: Data, length: Int) throws {
+    func publicKeyParse(publicKey: Data) throws {
         let header = publicKey[0]
         if publicKey.count == 33 {
             if header != 0x02 || header != 0x03 {
@@ -229,7 +250,7 @@ class SECP256k1: NSObject {
         
         var result = NSNumber.init(value: 0)
         _ = publicKey.withUnsafeBytes {(uint8Pointer: UnsafePointer<UInt8>) in
-            result = Int(secp256k1_ec_pubkey_parse(secp256k1Context, self.publicKey, uint8Pointer, length)) as NSNumber
+            result = Int(secp256k1_ec_pubkey_parse(secp256k1Context, self.publicKey, uint8Pointer, publicKey.count)) as NSNumber
         }
         if !result.boolValue {
             throw keyError.keyParsingFailed
@@ -629,4 +650,50 @@ class SECP256k1: NSObject {
         }
         return Data(buffer: buffer)
     }
+    
+    /**
+     
+     ECDSA public key recovery from signature
+     
+     - Parameter signature: Data
+     - Parameter message Data
+     
+     - Throws: keyError.keyRecoveryFailed if the ecp256k1 ecdsa recover function failed
+     
+     - Returns: a Data object with publicKey
+     
+     */
+    func recoverKeyFromSignature(signature: Data, message: Data) throws -> Data {
+        var result = NSNumber.init(value: 0)
+        _ = signature.withUnsafeBytes {(secp256k1SignaturePointer: UnsafePointer<secp256k1_ecdsa_recoverable_signature>) in
+            _ = message.withUnsafeBytes {(messagePointer: UnsafePointer<UInt8>) in
+                result = Int(secp256k1_ecdsa_recover(secp256k1Context, publicKey, secp256k1SignaturePointer, messagePointer)) as NSNumber
+            }
+        }
+        if !result.boolValue {
+            throw keyError.keyRecoveryFailed
+        }
+        let buffer = UnsafeBufferPointer(start: publicKey, count: 64);
+        return Data(buffer: buffer)
+    }
+    
+    /**
+     
+     Generates a random nonce of the specified lenght.
+     
+     - Parameter lenght: the lenght of the nonce
+     
+     - Returns: a Data object with the nonce.
+     
+     */
+    func generateNonce(lenght: Int) throws -> Data {
+        let nonce = NSMutableData(length: lenght)
+        let result = SecRandomCopyBytes(kSecRandomDefault, nonce!.length, nonce!.mutableBytes)
+        if result == errSecSuccess {
+            return nonce! as Data
+        } else {
+            throw nonceError.nonceGenerationError
+        }
+    }
 }
+

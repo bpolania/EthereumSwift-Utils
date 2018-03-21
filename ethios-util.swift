@@ -10,6 +10,16 @@ import SwiftKeccak
 
 class ethios_util: NSObject {
     
+    enum utilError: Error {
+        case failedToGeneratePublicFromPrivateKey
+        case failedToGenerateAddressFromPrivateKey
+        case failedToImportPublicKey
+        case failedToSignMessage
+        case failedToRecoverPublicKey
+        case invalidRecoveryId
+        case invalidSignatureLenght
+    }
+    
     /**
      * the max integer that this VM can handle (a BDouble)
      * @var BDouble MAX_INTEGER
@@ -59,9 +69,9 @@ class ethios_util: NSObject {
     var SHA3_RLP : Data
     
     override init() {
-        SHA3_NULL = SHA3_NULL_S.hexadecimal()!
-        SHA3_RLP_ARRAY = SHA3_RLP_ARRAY_S.hexadecimal()!
-        SHA3_RLP = SHA3_RLP_S.hexadecimal()!
+        SHA3_NULL = SHA3_NULL_S.hexadecimal
+        SHA3_RLP_ARRAY = SHA3_RLP_ARRAY_S.hexadecimal
+        SHA3_RLP = SHA3_RLP_S.hexadecimal
     }
     
     /**
@@ -85,7 +95,7 @@ class ethios_util: NSObject {
      */
     func zeroAddress() -> String {
         let zeroAddress = zeros(numberOfBytes:20)
-        return Format.hex(toString: zeroAddress)
+        return "0x" + Format.hex(toString: zeroAddress)
     }
     
     /**
@@ -259,11 +269,339 @@ class ethios_util: NSObject {
     
     /**
      * Checks if the private key satisfies the rules of the curve secp256k1.
-     * @param {Buffer} privateKey
-     * @return {Boolean}
+     * @param Data privateKey
+     * @return Bool
      */
+    func isPrivateKeyValid(privateKey: Data) -> Bool {
+        let secp256k1 = SECP256k1()
+        secp256k1.setPrivateKey(privateKey: privateKey)
+        return secp256k1.privateKeyVerify()
+    }
     
+    /**
+     * Checks if the public key satisfies the rules of the curve secp256k1
+     * and the requirements of Ethereum.
+     * @param Data publicKey data object
+     * @return Bool
+     */
+    func isPublicKeyValid(publicKey: Data) -> Bool {
+        let secp256k1 = SECP256k1()
+        do {
+            try secp256k1.publicKeyParse(publicKey: publicKey)
+            return true
+        } catch {
+            return false
+        }
+    }
     
-
+    /**
+     * Returns the ethereum address of a given public key.
+     * Accepts "Ethereum public keys" and SEC1 encoded keys.
+     * @param Data pubKey
+     * @return Data
+     */
+    func publicKeyToAddress(publicKey: Data) -> Data {
+        var pub = publicKey
+        pub.remove(at: pub.startIndex)
+        var sha3 = self.SHA3(input: publicKey)
+        sha3.remove(at: -20)
+        return sha3
+    }
+    
+    /**
+     * Returns the ethereum public key of a given private key
+     * @param Data privateKey A private key must be 256 bits wide
+     * @throw utilError.failedToGeneratePublicFromPrivateKey if secp256k1.publicKeyCreate fails
+     * @return Data
+     */
+    func getPublicFromPrivateKey(privateKey: Data) throws -> Data {
+        let secp256k1 = SECP256k1()
+        secp256k1.setPrivateKey(privateKey: privateKey)
+        do {
+            try secp256k1.publicKeyCreate()
+            return secp256k1.getPublicKey()
+        } catch {
+            throw utilError.failedToGeneratePublicFromPrivateKey
+        }
+    }
+    
+    /**
+     * Converts a public key to the Ethereum format.
+     * @param Data publicKey
+     * @return Data
+     */
+    func importPublicKey(publicKey: Data) throws -> Data {
+        let secp256k1 = SECP256k1()
+        do {
+            try secp256k1.publicKeyParse(publicKey: publicKey)
+            return secp256k1.getPublicKey()
+        } catch {
+            throw utilError.failedToImportPublicKey
+        }
+    }
+    
+    /**
+     * ECDSA sign
+     * @param Data message to be signed
+     * @param Data privateKey
+     * @throws utilError.failedToSignMessage
+     * @return Data signed message
+     */
+    func ECSign(message: Data, privateKey: Data) throws -> Data {
+        let secp256k1 = SECP256k1()
+        secp256k1.setPrivateKey(privateKey: privateKey)
+        do {
+            let nonce = try secp256k1.generateNonce(lenght: 4)
+            return try secp256k1.sign(message: message, nonceGenerationFunction: nil, nonceGenerationData: nonce)
+        } catch {
+            throw utilError.failedToSignMessage
+        }
+    }
+    
+    /**
+     * Returns the keccak-256 hash of `message`, prefixed with the header used by the `eth_sign` RPC call.
+     * The output of this function can be fed into `ecsign` to produce the same signature as the `eth_sign`
+     * call for a given `message`, or fed to `ecrecover` along with a signature to recover the public key
+     * used to produce the signature.
+     * @param message Data object with the message to be hashed
+     * @returns Data hashed message
+     */
+    func hashMessage(message: Data) -> Data {
+        var prefix = Data("0019".hexadecimal)
+        prefix.append("Ethereum Signed Message:\n".data(using: String.Encoding.utf8)!)
+        prefix.append(String(message.count).data(using: String.Encoding.utf8)!)
+        var result = Data(prefix)
+        result.append(message)
+        return result
+    }
+    
+    /**
+     * ECDSA public key recovery from signature
+     * @param Data signature
+     * @param Data message
+     * @throws utilError.failedToRecoverPublicKey
+     * @returns a Data object with publicKey
+     */
+    func publicKeyFromSignature(signature: Data, message: Data) throws -> Data {
+        let secp256k1 = SECP256k1()
+        do {
+            return try secp256k1.recoverKeyFromSignature(signature: signature, message: message)
+        } catch {
+            throw utilError.failedToRecoverPublicKey
+        }
+    }
+    
+    /**
+     * Convert signature parameters into the format of `eth_sign` RPC method
+     * @param Int v
+     * @param Data r
+     * @param Data s
+     * @throws utilError.invalidRecoveryId
+     * @return Hex String with the signature
+     */
+    func convertSignatureToRPCFormat(v : Int, r : Data, s : Data) throws -> String {
+        // NOTE: with potential introduction of chainId this might need to be updated
+        if (v != 27 && v != 28) {
+            throw utilError.invalidRecoveryId
+        }
+        // the RPC eth_sign method uses the 65 byte format used by Bitcoin
+        // FIXME: this might change in the future - https://github.com/ethereum/go-ethereum/issues/2053
+        var result = Data(self.setLength(msg: r, length: r.count, right: false))
+        result.append(self.setLength(msg: s, length: s.count, right: false))
+        result.append(self.convertToData(obj: (v-27))!)
+        return result.hexString
+    }
+    
+    /**
+     * Convert signature format of the `eth_sign` RPC method to signature parameters
+     * all because of a bug in geth: https://github.com/ethereum/go-ethereum/issues/2053
+     * @param Data signature
+     * @return [String : Any] dictionary
+     */
+    func convertSignatureFromRPCFormat(signature: Data) throws -> [String : Any] {
+        // NOTE: with potential introduction of chainId this might need to be updated
+        if (signature.count != 65) {
+            throw utilError.invalidSignatureLenght
+        }
+        var v = signature[64]
+        // support both versions of `eth_sign` responses
+        if (v < 27) {
+            v += 27
+        }
+        var sig = signature
+        
+        return [
+            "v": v,
+            "r": sig.removeSubrange(Range(32..<64)),
+            "s": sig.removeSubrange(Range(0..<32))
+        ]
+    }
+    
+    /**
+     * Returns the ethereum address of a given private key.
+     * @param Data privateKey A private key must be 256 bits wide
+     * @return Data object with the address
+     */
+    func privateKeyToAddress(privateKey: Data) throws -> Data {
+        do {
+            return try self.publicKeyToAddress(publicKey: self.getPublicFromPrivateKey(privateKey: privateKey))
+        } catch {
+            throw utilError.failedToGenerateAddressFromPrivateKey
+        }
+    }
+    
+    /**
+     * Checks if the address is a valid. Accepts checksummed addresses too
+     * @param String address
+     * @return Boolean success/fail
+     */
+    func isAddressValid(address: String) -> Bool {
+        let pattern = "0x[0-9a-fA-F]{40}$"
+        if address.range(of: pattern, options: .regularExpression, range: nil, locale: nil) != nil {
+            return true
+        }
+        return false
+    }
+    
+    /**
+     * Checks if a given address is a zero address
+     * @method isZeroAddress
+     * @param String address
+     * @return Bool
+     */
+    func isZeroAddress(address: String) -> Bool {
+        return self.zeroAddress() == self.addHexPrefix(string: address)
+    }
+    
+    /**
+     * Returns a checksummed address
+     * @param String address
+     * @return String checksummed address
+     */
+    func generateChecksumAddress(address: String) -> String {
+        let addressWithoutPrefix = self.stripHexPrefix(string: address).lowercased()
+        let hash = self.SHA3(input: addressWithoutPrefix)
+        var result = "0x"
+        
+        for index in 0..<hash.count {
+            if hash[index] >= 8 {
+                result += String(addressWithoutPrefix[addressWithoutPrefix.index(addressWithoutPrefix.startIndex, offsetBy: index)]).uppercased()
+            } else {
+                result += String(addressWithoutPrefix[addressWithoutPrefix.index(addressWithoutPrefix.startIndex, offsetBy: index)])
+            }
+        }
+        return result
+    }
+    
+    /**
+     * Checks if the address is a valid checksummed address
+     * @param Data the address to verify
+     * @return Bool
+     */
+    func isValidChecksumAddress(address: String) -> Bool {
+        return self.isAddressValid(address: address) && self.generateChecksumAddress(address: address) == address
+    }
+    
+    /**
+     * Generates an address of a newly created contract
+     * @param Data from the address which is creating this new address
+     * @param Data nonce the nonce of the from account
+     * @return Data
+     */
+    func generateAddress(from: String, nonce: String) -> Data {
+        // in RLP we want to encode null in the case of zero nonce
+        // read the RLP documentation for an answer if you dare
+        let _from = from.hexadecimal
+        let _nonce = BDouble(nonce, radix:16)
+        var nonceData = nonce.hexadecimal
+        if (_nonce?.isZero())! {
+            nonceData = Data()
+        }
+        // Only take the lower 160bits of the hash
+        let rlphash = self.RLPHash(input: [_from,nonceData])
+        return rlphash.subdata(in: Range(rlphash.count - 20..<rlphash.count))
+    }
+    
+    /**
+     * Returns true if the supplied address belongs to a precompiled account
+     * @param String address
+     * @return Bool
+     */
+    func isAddressPrecompiled(address: String) -> Bool {
+        let a = self.trimZeroes(data: address.hexadecimal)
+        return a.count == 1 && a[0] > 0 && a[0] < 5
+    }
+    
+    /**
+     * Checks if a string does not already start with "0x"
+     * @param String string
+     * @return Bool
+     */
+    func isHexPrefixed(string: String) -> Bool {
+        let start = String.Index(encodedOffset: 0)
+        let end = string.index(string.startIndex, offsetBy: 2)
+        if String(string[start..<end]) == "0x" {
+            return true
+        }
+        return  false
+    }
+    
+    /**
+     * Adds "0x" to a given `String` if it does not already start with "0x"
+     * @param String str
+     * @return String
+     */
+    func addHexPrefix(string: String) -> String {
+        return self.isHexPrefixed(string:string) ? string : "0x" + string
+    }
+    
+    /**
+     * Validate ECDSA signature
+     * @param Data v
+     * @param Data r
+     * @param Data s
+     * @param Bool homestead
+     * @return Bool
+     */
+    func isValidSignature(v : Int, r : Data, s : Data, homestead : Bool) -> Bool {
+        let SECP256K1_N_DIV_2 = BDouble("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0", radix:16)
+        let SECP256K1_N = BDouble("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141", radix:16)
+        if (r.count != 32 || s.count != 32) {
+            return false
+        }
+        if (v != 27 && v != 28) {
+            return false
+        }
+        let _r = BDouble(r.hexString, radix: 16)
+        let _s = BDouble(s.hexString, radix: 16)
+        if (_r!.isZero() || _r! > SECP256K1_N! || _s!.isZero() || _s! > SECP256K1_N!) {
+            return false
+        }
+        if ((homestead == false) && (_s! > SECP256K1_N_DIV_2!)) {
+            return false
+        }
+        return true
+    }
+    
+    /**
+     * Converts a `Data` object to JSON
+     * @param Data data
+     * @return JSON Object
+     */
+    func dataToJSON(data: Data) -> Any! {
+        return try? JSONSerialization.jsonObject(with: data, options: [])
+    }
+    
+    /**
+     * Removes "0x" from a given `String` if it starts with "0x"
+     * @param String str
+     * @return String
+     */
+    func stripHexPrefix(string: String) -> String {
+        let start = String.Index(encodedOffset: 0)
+        let end = string.index(string.startIndex, offsetBy: string.count)
+        return self.isHexPrefixed(string:string) ? String(string[start..<end]) : string
+    }
+    
 }
 
